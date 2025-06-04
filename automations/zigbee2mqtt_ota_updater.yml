@@ -1,0 +1,177 @@
+alias: Trigger OTA Updates for Allowed Zigbee2MQTT Devices
+description: >
+  Requests the Zigbee2MQTT device list and checks for available OTA updates for
+  all devices that (a) support OTA and (b) have a model_id in
+  `allowed_model_ids`. If an update is available, triggers the OTA process and
+  waits for completion.
+mode: single
+triggers: []
+
+variables:
+  ota_check_request_topic: zigbee2mqtt/bridge/request/device/ota_update/check
+  ota_check_response_topic: zigbee2mqtt/bridge/response/device/ota_update/check
+  ota_update_request_topic: zigbee2mqtt/bridge/request/device/ota_update/update
+  ota_update_response_topic: zigbee2mqtt/bridge/response/device/ota_update/update
+  device_list_request_topic: zigbee2mqtt/bridge/request/devices
+  device_list_response_topic: zigbee2mqtt/bridge/devices
+  allowed_model_ids:
+    - TRADFRI bulb GU10 WS 400lm
+    - Another_Model_Here
+
+actions:
+  - alias: Request full device list from Zigbee2MQTT
+    action: mqtt.publish
+    data:
+      topic: "{{ device_list_request_topic }}"
+      payload: "{}"
+  
+  - alias: Wait for device list response (max 10 s)
+    wait_for_trigger:
+      - topic: "{{ device_list_response_topic }}"
+        trigger: mqtt
+    timeout: "00:00:10"
+    continue_on_timeout: false
+
+  - alias: Extract eligible devices for OTA
+    variables:
+      z2m_devices: "{{ wait.trigger.payload_json }}"
+      devices_to_update: |
+        {{
+          z2m_devices
+          | selectattr('definition', 'defined')
+          | selectattr('definition.supports_ota', '==', true)
+          | selectattr('model_id', 'in', allowed_model_ids)
+          | map(attribute='friendly_name')
+          | list
+        }}
+
+  - alias: Log selected devices
+    action: logbook.log
+    data:
+      name: Z2M OTA
+      domain: homeassistant
+      message: "Devices selected for OTA check: {{ devices_to_update | join(', ') }}"
+
+  - alias: Run OTA check per device
+    repeat:
+      for_each: "{{ devices_to_update }}"
+      sequence:
+        - alias: Log OTA update check
+          action: logbook.log
+          data:
+            name: Z2M OTA
+            domain: homeassistant
+            message: "{{ repeat.item }} - checking for available OTA update."
+        - alias: Request OTA check
+          action: mqtt.publish
+          data:
+            topic: "{{ ota_check_request_topic }}"
+            payload: "{{ repeat.item }}"
+        - alias: Wait for OTA check response (max 30 s)
+          wait_for_trigger:
+            - topic: "{{ ota_check_response_topic }}"
+              value_template: >
+                {% set pl = value_json %} {% if pl.status == 'ok' and pl.data.id
+                == repeat.item %}
+                  true
+                {% elif pl.status == 'error' and 'id' in pl %}
+                  true
+                {% else %}
+                  false
+                {% endif %}
+              trigger: mqtt
+          timeout: "00:01:05"
+          continue_on_timeout: true
+        - alias: Determine if update is available
+          variables:
+            update_available: |
+              {% if wait.trigger is none %}
+                none
+              {% else %}
+                {% set payload = wait.trigger.payload_json %}
+                {% if payload.status == 'ok' and payload.data.id == repeat.item %}
+                  {{ payload.data.update_available | string | lower }}
+                {% elif payload.status == 'error' and "already in progress" in (payload.error | lower) %}
+                  'in_progress'
+                {% elif payload.status == 'error' and "didn't respond" in (payload.error | lower) %}
+                  none
+                {% else %}
+                  false
+                {% endif %}
+              {% endif %}
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: "{{ update_available == 'true' }}"
+              sequence:
+                - alias: Log OTA update starting
+                  action: logbook.log
+                  data:
+                    name: Z2M OTA
+                    domain: homeassistant
+                    message: "{{ repeat.item }} - OTA update starting."
+                - alias: Publish OTA update request
+                  action: mqtt.publish
+                  data:
+                    topic: "{{ ota_update_request_topic }}"
+                    payload: "{{ repeat.item }}"
+                - alias: Wait for OTA result (max 1 h)
+                  wait_for_trigger:
+                    - trigger: mqtt
+                      topic: "{{ ota_update_response_topic }}"
+                      value_template: >
+                        {{ value_json.status in ['ok', 'error'] and (repeat.item
+                        in (value_json.error or '') or value_json.data.id ==
+                        repeat.item) }}
+                  timeout: "01:00:00"
+                  continue_on_timeout: true
+                - alias: Log OTA result
+                  action: logbook.log
+                  data:
+                    name: Z2M OTA
+                    domain: homeassistant
+                    message: |
+                      {% set trigger = wait.trigger %} {% if trigger is none %}
+                        {{ repeat.item }} – OTA update timed out: no response received.
+                      {% elif trigger.payload_json.status == 'error' %}
+                        {{ repeat.item }} – OTA update failed: {{ trigger.payload_json.error }}
+                      {% elif trigger.payload_json.status == 'ok' %}
+                        {{ repeat.item }} – OTA update completed successfully.
+                      {% else %}
+                        {{ repeat.item }} – OTA update ended with unexpected response.
+                      {% endif %}
+            - conditions:
+                - condition: template
+                  value_template: "{{ update_available == 'false' }}"
+              sequence:
+                - alias: Log no update required
+                  action: logbook.log
+                  data:
+                    name: Z2M OTA
+                    domain: homeassistant
+                    message: "{{ repeat.item }} – no OTA update available."
+            - conditions:
+                - condition: template
+                  value_template: "{{ update_available == 'in_progress' }}"
+              sequence:
+                - alias: Log OTA already in progress
+                  action: logbook.log
+                  data:
+                    name: Z2M OTA
+                    domain: homeassistant
+                    message: >-
+                      {{ repeat.item }} – OTA update already in progress,
+                      skipping.
+            - conditions:
+                - condition: template
+                  value_template: "{{ update_available == 'none' }}"
+              sequence:
+                - alias: Log no response to OTA check
+                  action: logbook.log
+                  data:
+                    name: Z2M OTA
+                    domain: homeassistant
+                    message: >
+                      {{ (wait.trigger and wait.trigger.payload_json.status ==
+                      'error' and wait.trigger.payload_json.error) or 'No
+                      response from device' }}
