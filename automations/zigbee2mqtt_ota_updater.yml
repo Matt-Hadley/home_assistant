@@ -16,7 +16,9 @@ variables:
   device_list_response_topic: zigbee2mqtt/bridge/devices
   allowed_model_ids:
     - TRADFRI bulb GU10 WS 400lm
-    - Another_Model_Here
+    - TRADFRIbulbGU10WS345lm
+    - LTW001
+    - LCT007
 
 actions:
   - alias: Request full device list from Zigbee2MQTT
@@ -25,7 +27,7 @@ actions:
       topic: "{{ device_list_request_topic }}"
       payload: "{}"
   
-  - alias: Wait for device list response (max 10 s)
+  - alias: Wait for device list response (max 10s)
     wait_for_trigger:
       - topic: "{{ device_list_response_topic }}"
         trigger: mqtt
@@ -34,10 +36,9 @@ actions:
 
   - alias: Extract eligible devices for OTA
     variables:
-      z2m_devices: "{{ wait.trigger.payload_json }}"
-      devices_to_update: |
+      devices_to_update: >
         {{
-          z2m_devices
+          wait.trigger.payload_json
           | selectattr('definition', 'defined')
           | selectattr('definition.supports_ota', '==', true)
           | selectattr('model_id', 'in', allowed_model_ids)
@@ -67,7 +68,7 @@ actions:
           data:
             topic: "{{ ota_check_request_topic }}"
             payload: "{{ repeat.item }}"
-        - alias: Wait for OTA check response (max 30 s)
+        - alias: Wait for OTA check response (max 65s)
           wait_for_trigger:
             - topic: "{{ ota_check_response_topic }}"
               value_template: >
@@ -115,7 +116,7 @@ actions:
                   data:
                     topic: "{{ ota_update_request_topic }}"
                     payload: "{{ repeat.item }}"
-                - alias: Wait for OTA result (max 1 h)
+                - alias: Wait for OTA result (max 1h)
                   wait_for_trigger:
                     - trigger: mqtt
                       topic: "{{ ota_update_response_topic }}"
@@ -172,6 +173,6 @@ actions:
                     name: Z2M OTA
                     domain: homeassistant
                     message: >
-                      {{ (wait.trigger and wait.trigger.payload_json.status ==
+                      {{ repeat.item }} - {{ (wait.trigger and wait.trigger.payload_json.status ==
                       'error' and wait.trigger.payload_json.error) or 'No
                       response from device' }}
